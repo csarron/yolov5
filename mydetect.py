@@ -4,7 +4,7 @@ import platform
 import shutil
 import time
 from pathlib import Path
-
+import numpy as np
 import cv2
 import torch
 import torch.backends.cudnn as cudnn
@@ -15,7 +15,93 @@ from utils.datasets import LoadStreams, LoadImages
 from utils.general import (
     check_img_size, non_max_suppression, apply_classifier, scale_coords,
     xyxy2xywh, plot_one_box, strip_optimizer, set_logging)
+from utils.general import xywh2xyxy
 from utils.torch_utils import select_device, load_classifier, time_synchronized
+
+
+def get_grid_index(keep_idx, x):
+    dims = [xi[..., 0].numel() for xi in x]
+    i = 0
+    for dim in dims:
+        if keep_idx >= dim:
+            keep_idx -= dim
+            i += 1
+        else:
+            break
+    return i, np.unravel_index(keep_idx, x[i][..., 0].shape)[1:]
+
+
+def _process_feature(img, im0, output,
+                     conf_threshold=0.3, iou_threshold=0.3, num_features=32,
+                     ):
+    # input image: [3, 256, 320]
+    pred, x, features = output  # pred: [1, 5040,85]
+    # x[0]: [1, 3, 32, 40, 85], features[0]: [1, 128, 32, 40]
+    # x[1]: [1, 3, 16, 20, 85], features[1]: [1, 256, 16, 20]
+    # x[2]: [1, 3, 8, 10, 85], features[2]: [1, 512, 8, 10]
+    num_scales = len(features)
+    """3 steps: 
+    - prepare boxes and scores
+    - do nms, sort boxes by keep indices
+    - take either fixed number of boxes or by some threshold (variable #)
+    """
+    batch_size = pred.shape[0]
+    num_classes = pred[0].shape[1] - 5
+    feat_list = []
+    info_list = []
+    cls_list = []
+    for i in range(batch_size):
+        one_pred = pred[i]
+        # Compute conf
+        one_pred[:, 5:] *= one_pred[:, 4:5]  # conf = obj_conf * cls_conf
+        # Box (center x, center y, width, height) to (x1, y1, x2, y2)
+        boxes = xywh2xyxy(one_pred[:, :4])  # [5040, 4]
+
+        # scores = one_pred[:, 4]
+        max_conf = torch.zeros_like(one_pred[:, 4])  # [5040]
+        conf_thresh_tensor = torch.full_like(max_conf, conf_threshold)
+        start_index = 0
+        for cls_ind in range(start_index, num_classes):
+            cls_scores = one_pred[:, cls_ind + 5]  # 5040
+            keep = torch.ops.torchvision.nms(
+                boxes, cls_scores, iou_threshold)
+            max_conf[keep] = torch.where(
+                # Better than max one till now and minimally greater than conf_thresh
+                (cls_scores[keep] > max_conf[keep])
+                & (cls_scores[keep] > conf_thresh_tensor[keep]),
+                cls_scores[keep],
+                max_conf[keep],
+                )
+        sorted_scores, sorted_indices = torch.sort(max_conf,
+                                                   descending=True)
+        # TODO: use >0 to get variable boxes
+        num_boxes = (sorted_scores[: num_features] != 0).sum()
+        keep_boxes = sorted_indices[: num_features]
+        boxes = scale_coords(img[i].shape[2:], boxes, im0[i].shape).round()
+        # Normalize the boxes (to 0 ~ 1)
+        img_h, img_w = im0[i].shape[:2]
+        # boxes = boxes.copy()
+        boxes[:, (0, 2)] /= img_w
+        boxes[:, (1, 3)] /= img_h
+        # unravel_index to get original grid indices
+        feat = [[] for _ in range(num_scales)]
+        bboxes = [[] for _ in range(num_scales)]
+        classes = [[] for _ in range(num_scales)]
+        for keep_idx in keep_boxes:
+            one_x = [x[nsi][i] for nsi in range(num_scales)]
+            scale_idx, (dim1, dim2) = get_grid_index(keep_idx, one_x)
+            feat_idx = features[scale_idx][i][..., dim1, dim2]
+            feat[scale_idx].append(feat_idx)
+            bbox = boxes[keep_idx]
+            bboxes[scale_idx].append(bbox)
+            cls = one_pred[keep_idx][..., 5:].argmax()
+            classes[scale_idx].append(cls)
+        feat_list.append(feat)
+        cls_list.append(classes)
+        info_list.append(bboxes)
+        # print('size:', bbox.size(), feat.size())
+
+    return feat_list, info_list, cls_list
 
 
 def detect(save_img=False):
@@ -62,7 +148,7 @@ def detect(save_img=False):
     t0 = time.time()
     img = torch.zeros((1, 3, imgsz, imgsz), device=device)  # init img
     _ = model(img.half() if half else img) if device.type != 'cpu' else None  # run once
-    import torchprof
+    # import torchprof
     cuda = device.type != 'cpu'
 
     for path, img, im0s, vid_cap in dataset:
@@ -74,15 +160,19 @@ def detect(save_img=False):
 
         # Inference
         t1 = time_synchronized()
-        # with torchprof.Profile(model, use_cuda=cuda) as prof:
-        pred = model(img, augment=opt.augment)[0]
+        pred = model(img, augment=opt.augment)
+        feat_list, info_list, cls_list = _process_feature([img], [im0s], pred,
+                                                          opt.conf_thres,
+                                                          opt.iou_thres)
         # Apply NMS
-        pred = non_max_suppression(pred, opt.conf_thres, opt.iou_thres, classes=opt.classes, agnostic=opt.agnostic_nms)
+        pred = non_max_suppression(pred[0], opt.conf_thres,
+                                   opt.iou_thres, classes=opt.classes,
+                                   agnostic=opt.agnostic_nms)
         t2 = time_synchronized()
 
         # Apply Classifier
         if classify:
-            pred = apply_classifier(pred, modelc, img, im0s)
+            pred = apply_classifier(pred, model, img, im0s)
 
         # Process detections
         for i, det in enumerate(pred):  # detections per image
@@ -157,10 +247,10 @@ def detect(save_img=False):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--weights', nargs='+', type=str, default='yolov5s-vg.pt', help='model.pt path(s)')
+    parser.add_argument('--weights', nargs='+', type=str, default='yolov5s.pt', help='model.pt path(s)')
     parser.add_argument('--source', type=str, default='inference/images', help='source')  # file/folder, 0 for webcam
     parser.add_argument('--output', type=str, default='inference/output', help='output folder')  # output folder
-    parser.add_argument('--img-size', type=int, default=640, help='inference size (pixels)')
+    parser.add_argument('--img-size', type=int, default=320, help='inference size (pixels)')
     parser.add_argument('--conf-thres', type=float, default=0.4, help='object confidence threshold')
     parser.add_argument('--iou-thres', type=float, default=0.5, help='IOU threshold for NMS')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
