@@ -36,6 +36,7 @@ class Detect(nn.Module):
         # x = x.copy()  # for profiling
         z = []  # inference output
         self.training |= self.export
+        features = x.copy()
         for i in range(self.nl):
             x[i] = self.m[i](x[i])  # conv
             bs, _, ny, nx = x[i].shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
@@ -50,7 +51,7 @@ class Detect(nn.Module):
                 y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
                 z.append(y.view(bs, -1, self.no))
 
-        return x if self.training else (torch.cat(z, 1), x)
+        return x if self.training else (torch.cat(z, 1), x, features)
 
     @staticmethod
     def _make_grid(nx=20, ny=20):

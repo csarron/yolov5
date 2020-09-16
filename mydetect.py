@@ -32,7 +32,8 @@ def get_grid_index(keep_idx, x):
 
 
 def _process_feature(img, im0, output,
-                     conf_threshold=0.3, iou_threshold=0.3, num_features=32,
+                     conf_threshold=0.3, iou_threshold=0.3,
+                     num_per_scale_features=8,
                      ):
     # input image: [3, 256, 320]
     pred, x, features = output  # pred: [1, 5040,85]
@@ -47,9 +48,9 @@ def _process_feature(img, im0, output,
     """
     batch_size = pred.shape[0]
     num_classes = pred[0].shape[1] - 5
-    feat_list = []
-    info_list = []
-    cls_list = []
+    feat_list = [[] for _ in range(num_scales)]
+    info_list = [[] for _ in range(num_scales)]
+    cls_list = [[] for _ in range(num_scales)]
     for i in range(batch_size):
         one_pred = pred[i]
         # Compute conf
@@ -75,8 +76,9 @@ def _process_feature(img, im0, output,
         sorted_scores, sorted_indices = torch.sort(max_conf,
                                                    descending=True)
         # TODO: use >0 to get variable boxes
-        num_boxes = (sorted_scores[: num_features] != 0).sum()
-        keep_boxes = sorted_indices[: num_features]
+        # num_boxes = (sorted_scores != 0).sum()
+        # print('num_boxes: {}'.format(num_boxes))
+        # keep_boxes = sorted_indices[: num_features]
         boxes = scale_coords(img[i].shape[2:], boxes, im0[i].shape).round()
         # Normalize the boxes (to 0 ~ 1)
         img_h, img_w = im0[i].shape[:2]
@@ -87,20 +89,30 @@ def _process_feature(img, im0, output,
         feat = [[] for _ in range(num_scales)]
         bboxes = [[] for _ in range(num_scales)]
         classes = [[] for _ in range(num_scales)]
-        for keep_idx in keep_boxes:
+        for keep_idx in sorted_indices:
             one_x = [x[nsi][i] for nsi in range(num_scales)]
             scale_idx, (dim1, dim2) = get_grid_index(keep_idx, one_x)
+            if len(feat[scale_idx]) >= num_per_scale_features:
+                continue
             feat_idx = features[scale_idx][i][..., dim1, dim2]
             feat[scale_idx].append(feat_idx)
             bbox = boxes[keep_idx]
             bboxes[scale_idx].append(bbox)
             cls = one_pred[keep_idx][..., 5:].argmax()
             classes[scale_idx].append(cls)
-        feat_list.append(feat)
-        cls_list.append(classes)
-        info_list.append(bboxes)
-        # print('size:', bbox.size(), feat.size())
+        for ns in range(num_scales):
+            # feat[ns] = torch.stack(feat[ns], 0)
+            # classes[ns] = torch.stack(classes[ns], 0)
+            # bboxes[ns] = torch.stack(bboxes[ns], 0)
 
+            feat_list[ns].append(torch.stack(feat[ns], 0))
+            info_list[ns].append(torch.stack(bboxes[ns], 0))
+            cls_list[ns].append(torch.stack(classes[ns], 0))
+        # print('size:', bbox.size(), feat.size())
+    for ns in range(num_scales):
+        feat_list[ns] = torch.stack(feat_list[ns])
+        info_list[ns] = torch.stack(info_list[ns])
+        cls_list[ns] = torch.stack(cls_list[ns])
     return feat_list, info_list, cls_list
 
 
@@ -161,9 +173,9 @@ def detect(save_img=False):
         # Inference
         t1 = time_synchronized()
         pred = model(img, augment=opt.augment)
-        feat_list, info_list, cls_list = _process_feature([img], [im0s], pred,
-                                                          opt.conf_thres,
-                                                          opt.iou_thres)
+        # feat_list, info_list, cls_list = _process_feature([img], [im0s], pred,
+        #                                                   opt.conf_thres,
+        #                                                   opt.iou_thres)
         # Apply NMS
         pred = non_max_suppression(pred[0], opt.conf_thres,
                                    opt.iou_thres, classes=opt.classes,
@@ -251,8 +263,8 @@ if __name__ == '__main__':
     parser.add_argument('--source', type=str, default='inference/images', help='source')  # file/folder, 0 for webcam
     parser.add_argument('--output', type=str, default='inference/output', help='output folder')  # output folder
     parser.add_argument('--img-size', type=int, default=320, help='inference size (pixels)')
-    parser.add_argument('--conf-thres', type=float, default=0.4, help='object confidence threshold')
-    parser.add_argument('--iou-thres', type=float, default=0.5, help='IOU threshold for NMS')
+    parser.add_argument('--conf-thres', type=float, default=0.2, help='object confidence threshold')
+    parser.add_argument('--iou-thres', type=float, default=0.3, help='IOU threshold for NMS')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--view-img', action='store_true', help='display results')
     parser.add_argument('--save-txt', action='store_true', help='save results to *.txt')
