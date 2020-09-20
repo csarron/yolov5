@@ -9,6 +9,7 @@ import cv2
 import torch
 import torch.backends.cudnn as cudnn
 from numpy import random
+from torchvision.ops.boxes import batched_nms
 
 from models.experimental import attempt_load
 from utils.datasets import LoadStreams, LoadImages
@@ -17,6 +18,14 @@ from utils.general import (
     xyxy2xywh, plot_one_box, strip_optimizer, set_logging)
 from utils.general import xywh2xyxy
 from utils.torch_utils import select_device, load_classifier, time_synchronized
+
+
+def unravel_index(index, shape):
+    out = []
+    for dim in reversed(shape):
+        out.append(index % dim)
+        index = index // dim
+    return tuple(reversed(out))
 
 
 def get_grid_index(keep_idx, x):
@@ -28,10 +37,21 @@ def get_grid_index(keep_idx, x):
             i += 1
         else:
             break
-    return i, np.unravel_index(keep_idx, x[i][..., 0].shape)[1:]
+    return i, unravel_index(keep_idx, x[i][..., 0].shape)[1:]
 
 
-def _process_feature(img, im0, output,
+def get_scale_grid_index(keep_idx, x_shape, x_numel):
+    i = 0
+    for dim in x_numel:
+        if keep_idx >= dim:
+            keep_idx -= dim
+            i += 1
+        else:
+            break
+    return i, np.unravel_index(keep_idx, x_shape[i])[1:]
+
+
+def _process_feature(output, img_size, feat_shape,
                      conf_threshold=0.3, iou_threshold=0.3,
                      num_per_scale_features=8,
                      ):
@@ -41,79 +61,89 @@ def _process_feature(img, im0, output,
     # x[1]: [1, 3, 16, 20, 85], features[1]: [1, 256, 16, 20]
     # x[2]: [1, 3, 8, 10, 85], features[2]: [1, 512, 8, 10]
     num_scales = len(features)
+    # num_proposals = pred.shape[1]
+    num_classes = pred.shape[-1] - 5
+    batch_size = pred.shape[0]
+    device = pred.device
+    feat_shape = [torch.Size([3, img_size//s, img_size//s])
+                  for s in [8, 16, 32]]
+    shape_numel = torch.tensor([si.numel() for si in feat_shape]).to(device)
+    fs_shape = torch.cumsum(shape_numel, 0)
+    feat_shape = torch.tensor(feat_shape).to(device)
+
     """3 steps: 
     - prepare boxes and scores
     - do nms, sort boxes by keep indices
     - take either fixed number of boxes or by some threshold (variable #)
+    
+    optimization, first batch nms, second, set max 320 candidates,
+    third, improve index filtering
     """
-    batch_size = pred.shape[0]
-    num_classes = pred[0].shape[1] - 5
     feat_list = [[] for _ in range(num_scales)]
-    info_list = [[] for _ in range(num_scales)]
-    cls_list = [[] for _ in range(num_scales)]
+    box_list = [[] for _ in range(num_scales)]
     for i in range(batch_size):
         one_pred = pred[i]
+        one_mask = one_pred[..., 4] > conf_threshold  # candidates
+        one_mask_idx = torch.nonzero(one_mask, as_tuple=True)[0]
+        one_pred_s = one_pred[one_mask]
+
         # Compute conf
-        one_pred[:, 5:] *= one_pred[:, 4:5]  # conf = obj_conf * cls_conf
+        one_pred_s[:, 5:] *= one_pred_s[:, 4:5]  # conf = obj_conf * cls_conf
         # Box (center x, center y, width, height) to (x1, y1, x2, y2)
-        boxes = xywh2xyxy(one_pred[:, :4])  # [5040, 4]
+        boxes = xywh2xyxy(one_pred_s[:, :4])  # [5040, 4]
+        batch_boxes = boxes.unsqueeze(1).expand(
+            -1, num_classes, 4)
+        one_boxes = batch_boxes.contiguous().view(-1, 4)
+        scores = one_pred_s[:, 5:].reshape(-1)
+        mask = scores >= conf_threshold
+        mask_idx = torch.nonzero(mask, as_tuple=True)[0]
+        boxesf = one_boxes[mask]
+        scoresf = scores[mask].contiguous()
+        # idxsf = idxs[mask].contiguous()
+        cols = torch.arange(num_classes, dtype=torch.long)[None, :].to(device)
+        num_proposals = one_pred_s.shape[0]
+        label_idx = cols.expand(num_proposals, num_classes).reshape(-1)
+        labelsf = label_idx[mask]
+        keep = batched_nms(boxesf, scoresf, labelsf, iou_threshold)
 
-        # scores = one_pred[:, 4]
-        max_conf = torch.zeros_like(one_pred[:, 4])  # [5040]
-        conf_thresh_tensor = torch.full_like(max_conf, conf_threshold)
-        start_index = 0
-        for cls_ind in range(start_index, num_classes):
-            cls_scores = one_pred[:, cls_ind + 5]  # 5040
-            keep = torch.ops.torchvision.nms(
-                boxes, cls_scores, iou_threshold)
-            max_conf[keep] = torch.where(
-                # Better than max one till now and minimally greater than conf_thresh
-                (cls_scores[keep] > max_conf[keep])
-                & (cls_scores[keep] > conf_thresh_tensor[keep]),
-                cls_scores[keep],
-                max_conf[keep],
-                )
-        sorted_scores, sorted_indices = torch.sort(max_conf,
-                                                   descending=True)
-        # TODO: use >0 to get variable boxes
-        # num_boxes = (sorted_scores != 0).sum()
-        # print('num_boxes: {}'.format(num_boxes))
-        # keep_boxes = sorted_indices[: num_features]
-        boxes = scale_coords(img[i].shape[2:], boxes, im0[i].shape).round()
-        # Normalize the boxes (to 0 ~ 1)
-        img_h, img_w = im0[i].shape[:2]
-        # boxes = boxes.copy()
-        boxes[:, (0, 2)] /= img_w
-        boxes[:, (1, 3)] /= img_h
-        # unravel_index to get original grid indices
-        feat = [[] for _ in range(num_scales)]
-        bboxes = [[] for _ in range(num_scales)]
-        classes = [[] for _ in range(num_scales)]
-        for keep_idx in sorted_indices:
-            one_x = [x[nsi][i] for nsi in range(num_scales)]
-            scale_idx, (dim1, dim2) = get_grid_index(keep_idx, one_x)
-            if len(feat[scale_idx]) >= num_per_scale_features:
-                continue
-            feat_idx = features[scale_idx][i][..., dim1, dim2]
-            feat[scale_idx].append(feat_idx)
-            bbox = boxes[keep_idx]
-            bboxes[scale_idx].append(bbox)
-            cls = one_pred[keep_idx][..., 5:].argmax()
-            classes[scale_idx].append(cls)
+        proposal_idx, cls_idx = unravel_index(mask_idx, batch_boxes.shape[:-1])
+        proposal_idx = proposal_idx[keep]
+        proposal_idx = one_mask_idx[proposal_idx]
+        cls_idx = cls_idx[keep]
+        # cls_idx = one_mask_idx[cls_idx]
+        # cls_idx = cls_idx[keep]
+        # print('conf filtered num={}, iou_num={}'.format(
+        # boxesf.shape, keep.shape))
+        boxes /= img_size  # normalize to 0~1
+        num_props = len(proposal_idx)
+        ss = fs_shape.unsqueeze(1).expand(-1, num_props)
+        idx = (proposal_idx//ss).sum(dim=0)
+        # x_shape = torch.index_select(feat_shape, 0, idx.long())
+        prop_scale_dims = [unravel_index(proposal_idx[idx == nsi],
+                                         feat_shape[nsi])[1:]
+                           for nsi in range(num_scales)]
+        boxes_scale_idx = [keep[idx == nsi] for nsi in range(num_scales)]
+        # cls_scale_idx = [cls_idx[idx == nsi] for nsi in range(num_scales)]
+        feat = [[features[nsi][i][..., dim1, dim2]
+                 for dim1, dim2 in zip(*prop_scale_dims[nsi])]
+                for nsi in range(num_scales)]
+        box = [boxesf[boxes_scale_idx[nsi]] for nsi in range(num_scales)]
+        # cls = [cls_scale_idx[nsi] for nsi in range(num_scales)]
         for ns in range(num_scales):
-            # feat[ns] = torch.stack(feat[ns], 0)
-            # classes[ns] = torch.stack(classes[ns], 0)
-            # bboxes[ns] = torch.stack(bboxes[ns], 0)
-
-            feat_list[ns].append(torch.stack(feat[ns], 0))
-            info_list[ns].append(torch.stack(bboxes[ns], 0))
-            cls_list[ns].append(torch.stack(classes[ns], 0))
-        # print('size:', bbox.size(), feat.size())
+            if len(feat[ns]) > 0:
+                feat_ns = torch.stack(feat[ns][:num_per_scale_features], 0)
+                feat_list[ns].append(feat_ns)
+                box_list[ns].append(box[ns][:num_per_scale_features])
     for ns in range(num_scales):
-        feat_list[ns] = torch.stack(feat_list[ns])
-        info_list[ns] = torch.stack(info_list[ns])
-        cls_list[ns] = torch.stack(cls_list[ns])
-    return feat_list, info_list, cls_list
+        if len(feat_list[ns]) > 0:
+            feat_list[ns] = torch.stack(feat_list[ns])
+            box_list[ns] = torch.stack(box_list[ns])
+            # print('feat_list size:', feat_list[ns].size())
+        else:
+            feat_list[ns] = None
+            box_list[ns] = None
+            # print('feat_list size:', feat_list[ns])
+    return feat_list, box_list
 
 
 def detect(save_img=False):
@@ -154,6 +184,7 @@ def detect(save_img=False):
 
     # Get names and colors
     names = model.module.names if hasattr(model, 'module') else model.names
+    num_classes = len(names)
     colors = [[random.randint(0, 255) for _ in range(3)] for _ in range(len(names))]
 
     # Run inference
@@ -173,9 +204,12 @@ def detect(save_img=False):
         # Inference
         t1 = time_synchronized()
         pred = model(img, augment=opt.augment)
-        # feat_list, info_list, cls_list = _process_feature([img], [im0s], pred,
-        #                                                   opt.conf_thres,
-        #                                                   opt.iou_thres)
+        feat_shape = [torch.Size([3, 40, 40]),
+                      torch.Size([3, 20, 20]),
+                      torch.Size([3, 10, 10])]
+        feat_list, box_list = _process_feature(pred, imgsz, feat_shape,
+                                                opt.conf_thres,
+                                                opt.iou_thres)
         # Apply NMS
         pred = non_max_suppression(pred[0], opt.conf_thres,
                                    opt.iou_thres, classes=opt.classes,
@@ -259,12 +293,12 @@ def detect(save_img=False):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--weights', nargs='+', type=str, default='yolov5s.pt', help='model.pt path(s)')
-    parser.add_argument('--source', type=str, default='inference/images', help='source')  # file/folder, 0 for webcam
-    parser.add_argument('--output', type=str, default='inference/output', help='output folder')  # output folder
+    parser.add_argument('--weights', nargs='+', type=str, default='data/yolo/yolov5s-vg.pt', help='model.pt path(s)')
+    parser.add_argument('--source', type=str, default='data/test_imgs', help='source')  # file/folder, 0 for webcam
+    parser.add_argument('--output', type=str, default='data/test_imgs/output', help='output folder')  # output folder
     parser.add_argument('--img-size', type=int, default=320, help='inference size (pixels)')
-    parser.add_argument('--conf-thres', type=float, default=0.2, help='object confidence threshold')
-    parser.add_argument('--iou-thres', type=float, default=0.3, help='IOU threshold for NMS')
+    parser.add_argument('--conf-thres', type=float, default=0.05, help='object confidence threshold')
+    parser.add_argument('--iou-thres', type=float, default=0.5, help='IOU threshold for NMS')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--view-img', action='store_true', help='display results')
     parser.add_argument('--save-txt', action='store_true', help='save results to *.txt')
